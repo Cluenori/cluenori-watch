@@ -5,11 +5,15 @@ import { timeText } from "./alert.ts"
 import type { Outage } from "./outage.ts"
 import { OutageState } from "./outage.ts"
 
-/**
- * The label that marks an outage's issue. Only people with triage access can label an issue, so
- * an issue a stranger opens on this public repository is never taken for an outage.
- */
+/** The label that marks an outage's issue. */
 export const outageLabel = "cluenori-down"
+
+/**
+ * Who opens an outage's issue: the workflow, with its `GITHUB_TOKEN`. Only an issue with the label
+ * that this account opened is an outage, so an issue a stranger opens on this public repository is
+ * never taken for one, even when a maintainer labels it.
+ */
+export const outageAuthor = "github-actions[bot]"
 
 // GitHub answers within this, or the request failed.
 const answerTimeout = Duration.seconds(15)
@@ -23,6 +27,7 @@ const Issue = Schema.Struct({
   body: Schema.NullOr(Schema.String),
   pull_request: Schema.optionalKey(Schema.Unknown),
   labels: Schema.Array(Schema.Struct({ name: Schema.String })),
+  user: Schema.NullOr(Schema.Struct({ login: Schema.String })),
 })
 type Issue = typeof Issue.Type
 
@@ -37,31 +42,39 @@ const bodyOf = Effect.fn("bodyOf")(function* (state: OutageState) {
   return [
     `Cluenori's health check failed twice, a minute apart, at ${timeText(state.since)}: ${state.reason}.`,
     "",
-    `cluenori-watch reminds every hour while it stays down, and closes this issue once it answers again. Last alert: ${timeText(state.lastAlertAt)}.`,
+    `cluenori-watch reminds every hour while it stays down, and closes this issue once it answers again and Recovered reached every channel. Last alert: ${timeText(state.lastAlertAt)}.`,
+    ...(state.recoveredAt === undefined ? [] : ["", `Answering again since ${timeText(state.recoveredAt)}.`]),
     "",
     `<!-- cluenori-watch ${encoded} -->`,
   ].join("\n")
 })
 
-/** The outage's issue on GitHub: open it, find it, record its alerts, close it. */
+/**
+ * The outage's issue on GitHub: open it, find it, record its state, close it. Everything written
+ * passes through `redact` first: the repository is public.
+ */
 export interface Issues {
-  /** The open outage, if any: the oldest open issue with the outage's label. */
+  /** The open outage, if any: the oldest open issue with the outage's label that the workflow opened. */
   readonly open: Effect.Effect<Option.Option<Outage>, IssuesFailed>
   /** Opens an issue for a new outage, labelled, and returns it. */
   readonly openOutage: (state: OutageState) => Effect.Effect<Outage, IssuesFailed>
-  /** Records in the issue that an alert went at `at`. */
-  readonly recordAlert: (outage: Outage, at: DateTime.Utc) => Effect.Effect<Outage, IssuesFailed>
+  /** Replaces the issue's state with `state`, and returns the outage as it now is. */
+  readonly update: (outage: Outage, state: OutageState) => Effect.Effect<Outage, IssuesFailed>
   /** Adds `text` to the issue's conversation. */
   readonly comment: (outage: Outage, text: string) => Effect.Effect<void, IssuesFailed>
   /** Closes the issue, as completed. */
   readonly close: (outage: Outage) => Effect.Effect<void, IssuesFailed>
 }
 
-/** The issues of `repository` (`owner/name`), with `token`, which may read and write them. */
+/**
+ * The issues of `repository` (`owner/name`), with `token`, which may read and write them; `redact`
+ * masks the secrets in every body and comment written.
+ */
 export const makeIssues = Effect.fn("makeIssues")(function* (input: {
   readonly api: string
   readonly repository: string
   readonly token: Redacted.Redacted<string>
+  readonly redact: (text: string) => string
 }) {
   const client = yield* HttpClient.HttpClient
   const base = `${input.api}/repos/${input.repository}`
@@ -125,7 +138,7 @@ export const makeIssues = Effect.fn("makeIssues")(function* (input: {
   const open = Effect.gen(function* () {
     const answer = yield* ask("GET", `/issues?state=open&labels=${outageLabel}&sort=created&direction=asc&per_page=10`)
     const issues = yield* expect(answer, 200, "the open outages", Schema.Array(Issue))
-    const oldest = issues.find((issue) => issue.pull_request === undefined)
+    const oldest = issues.find((issue) => issue.pull_request === undefined && issue.user?.login === outageAuthor)
     return oldest === undefined ? Option.none<Outage>() : Option.some(yield* outageOf(oldest))
   })
 
@@ -144,7 +157,7 @@ export const makeIssues = Effect.fn("makeIssues")(function* (input: {
     }
     const created = yield* ask("POST", "/issues", {
       title: `Cluenori is down since ${timeText(state.since)}`,
-      body: yield* bodyOf(state),
+      body: input.redact(yield* bodyOf(state)),
       labels: [outageLabel],
     })
     const issue = yield* expect(created, 201, "opening the outage's issue", Issue)
@@ -156,16 +169,15 @@ export const makeIssues = Effect.fn("makeIssues")(function* (input: {
     return yield* outageOf(issue)
   })
 
-  const recordAlert = Effect.fn("recordAlert")(function* (outage: Outage, at: DateTime.Utc) {
-    const state: OutageState = { alert: outage.alert, since: outage.since, lastAlertAt: at, reason: outage.reason }
-    const answer = yield* ask("PATCH", `/issues/${outage.issue}`, { body: yield* bodyOf(state) })
-    yield* expect(answer, 200, "recording the alert", Issue)
-    const recorded: Outage = { ...outage, lastAlertAt: at }
-    return recorded
+  const update = Effect.fn("update")(function* (outage: Outage, state: OutageState) {
+    const answer = yield* ask("PATCH", `/issues/${outage.issue}`, { body: input.redact(yield* bodyOf(state)) })
+    yield* expect(answer, 200, "recording the outage's state", Issue)
+    const updated: Outage = { ...state, issue: outage.issue, url: outage.url }
+    return updated
   })
 
   const comment = Effect.fn("comment")(function* (outage: Outage, text: string) {
-    const answer = yield* ask("POST", `/issues/${outage.issue}/comments`, { body: text })
+    const answer = yield* ask("POST", `/issues/${outage.issue}/comments`, { body: input.redact(text) })
     if (answer.status !== 201) {
       return yield* new IssuesFailed({
         reason: `GitHub answered a comment on #${outage.issue} with HTTP ${answer.status}`,
@@ -178,7 +190,7 @@ export const makeIssues = Effect.fn("makeIssues")(function* (input: {
     yield* expect(answer, 200, "closing the outage's issue", Issue)
   })
 
-  const issues: Issues = { open, openOutage, recordAlert, comment, close }
+  const issues: Issues = { open, openOutage, update, comment, close }
   return issues
 })
 

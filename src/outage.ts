@@ -7,14 +7,33 @@ export type Health =
   | { readonly _tag: "Down"; readonly reason: string }
 
 /**
+ * The last alert's delivery, by channel name. A run records the channels it is about to send
+ * through as `claimed` before it sends, then moves those that failed to `retry`. The next runs send
+ * `retry` again, claiming them first, for an hour. A channel still `claimed` when a run starts was
+ * sent by a run that stopped before recording how it went: it may have arrived, so it is never sent
+ * again. Each channel gets each alert at most once per attempt, and is never sent one twice after a
+ * crash.
+ */
+export const Delivery = Schema.Struct({
+  kind: Schema.Literals(["Down", "Reminder", "Recovered"]),
+  at: Schema.DateTimeUtcFromString,
+  claimed: Schema.Array(Schema.String),
+  retry: Schema.Array(Schema.String),
+})
+export type Delivery = typeof Delivery.Type
+
+/**
  * What the open issue keeps of an outage, in its body: the UUID its alerts ring under, when it
- * began, when the last alert went, and why.
+ * began, when the last alert went, why, how that alert's delivery went, and when it recovered. A
+ * recovered outage's issue stays open until Recovered reached every channel, or an hour passed.
  */
 export const OutageState = Schema.Struct({
   alert: Schema.String.check(Schema.isUUID()),
   since: Schema.DateTimeUtcFromString,
   lastAlertAt: Schema.DateTimeUtcFromString,
   reason: Schema.String,
+  delivery: Schema.optionalKey(Delivery),
+  recoveredAt: Schema.optionalKey(Schema.DateTimeUtcFromString),
 })
 export type OutageState = typeof OutageState.Type
 
@@ -23,6 +42,16 @@ export interface Outage extends OutageState {
   readonly issue: number
   readonly url: string
 }
+
+/** The state `outage`'s issue keeps. */
+export const stateOf = (outage: Outage): OutageState => ({
+  alert: outage.alert,
+  since: outage.since,
+  lastAlertAt: outage.lastAlertAt,
+  reason: outage.reason,
+  ...(outage.delivery === undefined ? {} : { delivery: outage.delivery }),
+  ...(outage.recoveredAt === undefined ? {} : { recoveredAt: outage.recoveredAt }),
+})
 
 /** Reminders while it stays down come this far apart, at most. */
 export const remindEvery = Duration.hours(1)

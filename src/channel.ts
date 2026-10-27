@@ -3,7 +3,10 @@ import { Config, Option, Schema } from "effect"
 
 import type { Alert } from "./alert.ts"
 
-/** A channel couldn't deliver an alert, and why, in words without secrets. */
+/**
+ * A channel couldn't deliver an alert, and why: the service's own words, which may echo what was
+ * sent, so the run redacts and shortens them before showing them anywhere.
+ */
 export class ChannelFailed extends Schema.TaggedError<ChannelFailed>()("ChannelFailed", {
   reason: Schema.String,
 }) {}
@@ -44,5 +47,8 @@ export const secretsOf = (configured: Configured) => (configured._tag === "Off" 
 export const secret = (name: string) =>
   Config.option(Config.String(name)).pipe(Config.map(Option.filter((value) => value.trim() !== "")))
 
-/** At most this much of a service's own words about a failure goes into the report. */
+/**
+ * At most this much of a service's own words goes into the report. Shorten only redacted text: a
+ * cut can split a secret, and the part left wouldn't be masked.
+ */
 export const reasonText = (text: string) => (text.length > 300 ? `${text.slice(0, 300)}…` : text)

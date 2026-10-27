@@ -4,13 +4,13 @@ import type { Alert } from "./alert.ts"
 import { downAlert, recoveredAlert, reminderAlert, testAlert, timeText } from "./alert.ts"
 import { apns } from "./apns.ts"
 import type { Configured } from "./channel.ts"
-import { secret, secretsOf } from "./channel.ts"
+import { reasonText, secret, secretsOf } from "./channel.ts"
 import { email } from "./email.ts"
 import { checkHealth } from "./health.ts"
 import type { Issues } from "./issues.ts"
 import { makeIssues, stampText } from "./issues.ts"
-import type { Decision, Health } from "./outage.ts"
-import { afterFirst, afterSecond, confirmAfter } from "./outage.ts"
+import type { Decision, Delivery, Health, Outage } from "./outage.ts"
+import { afterFirst, afterSecond, confirmAfter, remindEvery, stateOf } from "./outage.ts"
 import type { Report } from "./report.ts"
 import { makeReport } from "./report.ts"
 import { telegram } from "./telegram.ts"
@@ -31,49 +31,96 @@ const settings = Config.all({
 const describeHealth = (health: Health) =>
   health._tag === "Up" ? `answered HTTP ${health.status}` : `failed: ${health.reason}`
 
-/** Sends `alert` through every channel at once; one that fails stops none of the others. */
+/** What one channel did with an alert: a line for the report, and whether to send it again. */
+interface Sent {
+  readonly name: string
+  readonly line: string
+  readonly failed: boolean
+}
+
+/** The names of the channels that are on: the ones an alert is claimed for. */
+const onNames = (channels: ReadonlyArray<Configured>) =>
+  channels.flatMap((configured) => (configured._tag === "On" ? [configured.channel.name] : []))
+
+/**
+ * Sends `alert` through every channel at once, or only those named in `only`. One that fails, or
+ * stops unexpectedly, stops none of the others. Every service's words are redacted, then shortened.
+ */
 const sendAll = Effect.fn("sendAll")(function* (
   channels: ReadonlyArray<Configured>,
   alert: Alert,
   report: Report,
   dryRun: boolean,
+  only?: ReadonlyArray<string>,
 ) {
+  const words = (text: string) => reasonText(report.redact(text))
+  const chosen =
+    only === undefined ? channels : channels.filter((each) => each._tag === "On" && only.includes(each.channel.name))
   const results = yield* Effect.forEach(
-    channels,
+    chosen,
     (configured) =>
       Effect.gen(function* () {
         switch (configured._tag) {
           case "Off":
-            return Option.none<string>()
+            return Option.none<Sent>()
           case "Misconfigured":
             yield* report.failure(`${configured.name} isn't set up right: ${configured.reason}`)
-            return Option.some(`${configured.name}: not set up right`)
+            return Option.some<Sent>({
+              name: configured.name,
+              line: `${configured.name}: not set up right`,
+              failed: false,
+            })
           case "On": {
             const channel = configured.channel
             if (dryRun) {
               yield* report.line(`${channel.name} would send:\n\n\`\`\`\n${channel.preview(alert).join("\n")}\n\`\`\``)
-              return Option.some(`${channel.name}: dry run`)
+              return Option.some<Sent>({ name: channel.name, line: `${channel.name}: dry run`, failed: false })
             }
-            const sent = yield* channel.send(alert).pipe(Effect.result)
-            if (sent._tag === "Success") {
-              yield* report.line(`${channel.name}: sent, ${sent.success}.`)
-              return Option.some(`${channel.name}: sent, ${sent.success}`)
+            // The whole send, defects included, so a channel that breaks never interrupts another.
+            const sent = yield* channel.send(alert).pipe(Effect.exit)
+            if (Exit.isSuccess(sent)) {
+              yield* report.line(`${channel.name}: sent, ${words(sent.value)}.`)
+              return Option.some<Sent>({
+                name: channel.name,
+                line: `${channel.name}: sent, ${words(sent.value)}`,
+                failed: false,
+              })
             }
-            yield* report.failure(`${channel.name} couldn't send "${alert.title}": ${sent.failure.reason}`)
-            return Option.some(`${channel.name}: failed, ${sent.failure.reason}`)
+            const failure = Cause.findErrorOption(sent.cause)
+            const why = Option.isSome(failure) ? words(failure.value.reason) : "it stopped unexpectedly"
+            yield* report.failure(`${channel.name} couldn't send "${alert.title}": ${why}`)
+            return Option.some<Sent>({ name: channel.name, line: `${channel.name}: failed, ${why}`, failed: true })
           }
         }
       }),
     { concurrency: "unbounded" },
   )
-  const said = results.flatMap(Option.toArray)
-  if (said.length === 0) {
+  const sent = results.flatMap(Option.toArray)
+  if (sent.length === 0 && only === undefined) {
     yield* report.warning(`No channel is set up, so "${alert.title}" reached no one: see the README.`)
   }
-  return said
+  return sent
 })
 
-/** One run of `watch`: check, confirm a change a minute later, then act on what changed. */
+/** The alert `outage`'s delivery is of, as it was first sent. */
+const alertOf = (outage: Outage, delivery: Delivery): Alert => {
+  switch (delivery.kind) {
+    case "Down":
+      return downAlert({ reason: outage.reason, alert: outage.alert, at: delivery.at, link: outage.url })
+    case "Reminder":
+      return reminderAlert({
+        reason: outage.reason,
+        alert: outage.alert,
+        since: outage.since,
+        at: delivery.at,
+        link: outage.url,
+      })
+    case "Recovered":
+      return recoveredAlert({ alert: outage.alert, since: outage.since, at: delivery.at, link: outage.url })
+  }
+}
+
+/** One run of `watch`: finish what an earlier run left, check, confirm a change a minute later, then act on it. */
 const watch = Effect.fn("watch")(function* (input: {
   readonly deployment: Redacted.Redacted<string>
   readonly issues: Issues
@@ -82,29 +129,93 @@ const watch = Effect.fn("watch")(function* (input: {
   readonly dryRun: boolean
   readonly runLink: string
 }) {
-  const { issues, report, dryRun } = input
+  const { issues, report, dryRun, channels } = input
   const crypto = yield* Crypto.Crypto
-  const outage = yield* issues.open
-  if (Option.isSome(outage)) {
-    yield* report.line(`Down since ${stampText(outage.value.since)} (${outage.value.url}).`)
+  const results = (sent: ReadonlyArray<Sent>) =>
+    sent.length === 0 ? "No channel is set up." : sent.map((each) => `- ${each.line}`).join("\n")
+  const thisRun = `[This run](${input.runLink})`
+
+  // Sends the alert `claimed`'s delivery is of through the channels it claims, then records those
+  // that failed, to retry. A failure to record leaves them claimed: never sent again.
+  const deliver = Effect.fn("deliver")(function* (claimed: Outage, delivery: Delivery, heading: string) {
+    const sent = yield* sendAll(channels, alertOf(claimed, delivery), report, false, delivery.claimed)
+    const retry = sent.filter((each) => each.failed).map((each) => each.name)
+    const recorded = yield* issues.update(claimed, {
+      ...stateOf(claimed),
+      delivery: { ...delivery, claimed: [], retry },
+    })
+    const next = retry.length === 0 ? "" : `\n\nSent again on the next runs, for an hour: ${retry.join(", ")}.`
+    yield* issues.comment(recorded, `${heading}:\n\n${results(sent)}${next}\n\n${thisRun}`)
+    return recorded
+  })
+
+  // What an earlier run left: a delivery whose outcome is unknown, channels to retry, and a
+  // recovered outage to close once nothing is left to send. The outage as it is after, or none
+  // when its issue closed.
+  const finish = Effect.fn("finish")(function* (outage: Outage) {
+    let current = outage
+    const left = current.delivery
+    if (left !== undefined && left.claimed.length > 0) {
+      const unknown = `${left.kind} through ${left.claimed.join(", ")}: unknown. The run sending it stopped before saying how it went, so it isn't sent again.`
+      yield* report.warning(unknown)
+      if (!dryRun) {
+        current = yield* issues.update(current, { ...stateOf(current), delivery: { ...left, claimed: [] } })
+        yield* issues.comment(current, `${unknown}\n\n${thisRun}`)
+      }
+    }
+    const pending = current.delivery
+    if (pending !== undefined && pending.retry.length > 0) {
+      const now = yield* DateTime.now
+      const names = pending.retry.join(", ")
+      if (DateTime.isGreaterThanOrEqualTo(now, DateTime.addDuration(pending.at, remindEvery))) {
+        const given = `${pending.kind} never reached ${names} in the hour after ${timeText(pending.at)}, so it isn't sent again.`
+        yield* report.failure(given)
+        if (!dryRun) {
+          current = yield* issues.update(current, { ...stateOf(current), delivery: { ...pending, retry: [] } })
+          yield* issues.comment(current, `${given}\n\n${thisRun}`)
+        }
+      } else if (dryRun) {
+        yield* report.line(`Would send ${pending.kind} again through ${names}:`)
+        yield* sendAll(channels, alertOf(current, pending), report, true, pending.retry)
+      } else {
+        yield* report.line(`Sending ${pending.kind} again through ${names}.`)
+        const again: Delivery = { ...pending, claimed: pending.retry, retry: [] }
+        const claimed = yield* issues.update(current, { ...stateOf(current), delivery: again })
+        current = yield* deliver(claimed, again, `${pending.kind}, sent again at ${stampText(now)}`)
+      }
+    }
+    const done =
+      current.delivery === undefined || (current.delivery.claimed.length === 0 && current.delivery.retry.length === 0)
+    if (current.recoveredAt !== undefined && done && !dryRun) {
+      yield* issues.close(current)
+      yield* report.line(`Recovered reached every channel it could: closed ${current.url}.`)
+      return Option.none<Outage>()
+    }
+    return Option.some(current)
+  })
+
+  const found = yield* issues.open
+  const outage = Option.isSome(found) ? yield* finish(found.value) : Option.none<Outage>()
+  // A recovered outage still sending Recovered isn't down: its checks start from up.
+  const active = Option.filter(outage, (each) => each.recoveredAt === undefined)
+  if (Option.isSome(active)) {
+    yield* report.line(`Down since ${stampText(active.value.since)} (${active.value.url}).`)
   }
   const firstAt = yield* DateTime.now
   const first = yield* checkHealth(input.deployment)
   yield* report.line(`Health check ${describeHealth(first)}.`)
-  const early = afterFirst(outage, first, firstAt)
+  const early = afterFirst(active, first, firstAt)
   let decision: Decision
   if (early._tag === "Confirm") {
     yield* report.line("That would change what's known, so a second check confirms it in a minute.")
     yield* Effect.sleep(confirmAfter)
     const second = yield* checkHealth(input.deployment)
     yield* report.line(`Second check ${describeHealth(second)}.`)
-    decision = afterSecond(outage, first, firstAt, second)
+    decision = afterSecond(active, first, firstAt, second)
   } else {
     decision = early
   }
   const now = yield* DateTime.now
-  const results = (said: ReadonlyArray<string>) =>
-    said.length === 0 ? "No channel is set up." : said.map((line) => `- ${line}`).join("\n")
 
   switch (decision._tag) {
     case "Up":
@@ -120,74 +231,67 @@ const watch = Effect.fn("watch")(function* (input: {
       if (dryRun) {
         yield* report.line("Down, confirmed. Would open an issue, then send:")
         yield* sendAll(
-          input.channels,
+          channels,
           downAlert({ reason: decision.reason, alert: alertId, at: now, link: "<the issue>" }),
           report,
           true,
         )
         return
       }
-      // The issue comes first: if it can't be opened, nothing is sent, so the next run doesn't
-      // send Down again.
+      // Down again before Recovered reached every channel: that outage is over.
+      if (Option.isSome(outage)) {
+        yield* issues.comment(
+          outage.value,
+          `Down again before Recovered reached every channel: a new issue follows.\n\n${thisRun}`,
+        )
+        yield* issues.close(outage.value)
+      }
+      // The issue comes first, claiming every channel: if it can't be opened, nothing is sent, so
+      // the next run doesn't send Down again.
+      const delivery: Delivery = { kind: "Down", at: now, claimed: onNames(channels), retry: [] }
       const opened = yield* issues.openOutage({
         alert: alertId,
         since: decision.since,
         lastAlertAt: now,
         reason: decision.reason,
+        delivery,
       })
       yield* report.line(`Down, confirmed: opened ${opened.url}.`)
-      const said = yield* sendAll(
-        input.channels,
-        downAlert({ reason: decision.reason, alert: alertId, at: now, link: opened.url }),
-        report,
-        false,
-      )
-      yield* issues.comment(opened, `Alerted at ${stampText(now)}:\n\n${results(said)}\n\n[This run](${input.runLink})`)
+      yield* deliver(opened, delivery, `Alerted at ${stampText(now)}`)
       return
     }
     case "Remind": {
-      const alert = (link: string) =>
-        reminderAlert({
-          reason: decision.reason,
-          alert: decision.outage.alert,
-          since: decision.outage.since,
-          at: now,
-          link,
-        })
+      const delivery: Delivery = { kind: "Reminder", at: now, claimed: onNames(channels), retry: [] }
       if (dryRun) {
         yield* report.line("Still down, an hour after the last alert. Would remind:")
-        yield* sendAll(input.channels, alert(decision.outage.url), report, true)
+        yield* sendAll(channels, alertOf({ ...decision.outage, reason: decision.reason }, delivery), report, true)
         return
       }
-      // Recorded first, so a failure to record never sends a reminder every five minutes.
-      const recorded = yield* issues.recordAlert(decision.outage, now)
-      const said = yield* sendAll(input.channels, alert(recorded.url), report, false)
-      yield* issues.comment(
-        recorded,
-        `Still down: ${decision.reason}. Reminded at ${stampText(now)}:\n\n${results(said)}\n\n[This run](${input.runLink})`,
-      )
+      // Recorded first, so a failure to record never sends a reminder every five minutes. A
+      // reminder replaces whatever was left of the last alert's delivery.
+      const claimed = yield* issues.update(decision.outage, {
+        ...stateOf(decision.outage),
+        reason: decision.reason,
+        lastAlertAt: now,
+        delivery,
+      })
+      yield* deliver(claimed, delivery, `Still down: ${decision.reason}. Reminded at ${stampText(now)}`)
       return
     }
     case "Recovered": {
-      const recovered = recoveredAlert({
-        alert: decision.outage.alert,
-        since: decision.outage.since,
-        at: now,
-        link: decision.outage.url,
-      })
+      const delivery: Delivery = { kind: "Recovered", at: now, claimed: onNames(channels), retry: [] }
       if (dryRun) {
-        yield* report.line("Recovered, confirmed. Would close the issue, then send:")
-        yield* sendAll(input.channels, recovered, report, true)
+        yield* report.line("Recovered, confirmed. Would send, then close the issue:")
+        yield* sendAll(channels, alertOf(decision.outage, delivery), report, true)
         return
       }
-      // Closed first, so Recovered is sent once.
-      yield* issues.close(decision.outage)
-      yield* report.line(`Recovered: closed ${decision.outage.url}.`)
-      const said = yield* sendAll(input.channels, recovered, report, false)
-      yield* issues.comment(
-        decision.outage,
-        `Recovered at ${stampText(now)}: ${recovered.body}\n\n${results(said)}\n\n[This run](${input.runLink})`,
-      )
+      // Recorded first, so Recovered is sent once; the issue closes once it reached every channel.
+      const claimed = yield* issues.update(decision.outage, { ...stateOf(decision.outage), recoveredAt: now, delivery })
+      const recorded = yield* deliver(claimed, delivery, `Recovered at ${stampText(now)}`)
+      if (recorded.delivery?.retry.length === 0) {
+        yield* issues.close(recorded)
+        yield* report.line(`Recovered: closed ${recorded.url}.`)
+      }
       return
     }
   }
@@ -236,7 +340,12 @@ export const program = Effect.gen(function* () {
     if (Option.isNone(token)) {
       return yield* report.failure("GITHUB_TOKEN is missing: the workflow passes it.")
     }
-    const issues = yield* makeIssues({ api: run.api, repository: run.repository, token: Redacted.make(token.value) })
+    const issues = yield* makeIssues({
+      api: run.api,
+      repository: run.repository,
+      token: Redacted.make(token.value),
+      redact: report.redact,
+    })
     yield* watch({ deployment: Redacted.make(deployment.value), issues, channels, report, dryRun: run.dryRun, runLink })
   }).pipe(Effect.exit)
   if (Exit.isFailure(outcome)) {

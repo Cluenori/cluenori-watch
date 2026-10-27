@@ -3,7 +3,7 @@ import { HttpClient, HttpClientRequest } from "effect/http"
 
 import type { Alert } from "./alert.ts"
 import type { Configured } from "./channel.ts"
-import { ChannelFailed, reasonText, secret } from "./channel.ts"
+import { ChannelFailed, secret } from "./channel.ts"
 
 // Cloudflare's API answers within this, or the send failed.
 const answerTimeout = Duration.seconds(15)
@@ -93,7 +93,7 @@ export const email = Effect.gen(function* () {
           )
           const why = bounced.length > 0 ? "the address bounced" : messages.join(", ")
           return yield* new ChannelFailed({
-            reason: reasonText(`HTTP ${response.status}${why === "" ? "" : `: ${why}`}`),
+            reason: `HTTP ${response.status}${why === "" ? "" : `: ${why}`}`,
           })
         }).pipe(
           Effect.timeout(answerTimeout),

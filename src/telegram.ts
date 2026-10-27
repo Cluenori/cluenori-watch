@@ -3,7 +3,7 @@ import { HttpClient, HttpClientRequest } from "effect/http"
 
 import type { Alert } from "./alert.ts"
 import type { Configured } from "./channel.ts"
-import { ChannelFailed, reasonText, secret } from "./channel.ts"
+import { ChannelFailed, secret } from "./channel.ts"
 
 // Telegram's Bot API answers within this, or the send failed.
 const answerTimeout = Duration.seconds(10)
@@ -64,9 +64,7 @@ export const telegram = Effect.gen(function* () {
           }
           const description = Option.flatMap(answer, (each) => Option.fromUndefinedOr(each.description))
           return yield* new ChannelFailed({
-            reason: reasonText(
-              `HTTP ${response.status}${Option.match(description, { onNone: () => "", onSome: (text) => `: ${text}` })}`,
-            ),
+            reason: `HTTP ${response.status}${Option.match(description, { onNone: () => "", onSome: (text) => `: ${text}` })}`,
           })
         }).pipe(
           Effect.timeout(answerTimeout),

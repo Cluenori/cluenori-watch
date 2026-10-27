@@ -16,14 +16,19 @@ asks `<deployment>/api/health`. A 2xx answer means up. Any other status, a redir
   `cluenori-down` opens; it holds the outage's state.
 - **Still down** goes once an hour while the outage lasts, as a time-sensitive push, not an alarm.
 - **Recovered** goes once, after two checks a minute apart answer. It's a quiet push that stops
-  the alarm, and the issue closes.
+  the alarm, and the issue closes once it reached every channel.
 - A failure that the second check doesn't confirm changes nothing and sends nothing.
-- One channel failing never stops the others. A failed send fails the run, so it shows red with
-  the reason, and the issue's comment lists what each channel did.
+- One channel failing, or breaking, never stops the others. A failed send fails the run, so it
+  shows red with the reason, and the issue's comment lists what each channel did.
+- **A failed send is sent again,** through that channel only, on the next runs, for an hour.
 
-The issue is the only state. If it can't be opened or updated, nothing is sent, so a broken run
-never sends Down every 5 minutes. Only someone with triage access can label an issue, so an issue
-a stranger opens never counts as an outage.
+The issue is the only state, and it records each alert's delivery by channel. Before a run sends,
+it records the channels it is about to send through; after, which of them failed. If it can't
+record first, nothing is sent, so a broken run never sends Down every 5 minutes. If it stops after
+sending and before recording how it went, those channels aren't sent that alert again: it may have
+arrived, and an alert never comes twice. Only an issue that this workflow opened and labelled
+`cluenori-down` counts, so an issue a stranger opens never counts as an outage, even when someone
+labels it. What the run writes to the issue is redacted like its log: the repository is public.
 
 ## Set it up
 
