@@ -8,11 +8,13 @@ Cluenori, and also writes to Telegram and sends email.
 ## What it does
 
 Every 5 minutes it asks `<deployment>/api/health`. A watching run checks on every 5-minute mark for
-5 h 40 min, then starts the next watching run, so the watch doesn't depend on GitHub's schedule,
+55 minutes, then starts the next watching run, so the watch doesn't depend on GitHub's schedule,
 which may start runs late, skip them, or, for a new repository, not start them at all. The schedule
 stays as a backstop that starts a watching run again if the chain ever breaks. Runs that write the
 outage's state go one at a time, and each check reads that state from the issue afresh, so a
-handover between runs loses nothing and sends nothing twice. A 2xx answer means up. Any other status, a redirect, no answer in
+handover between runs loses nothing and sends nothing twice. A run reads its secrets when it is
+queued, so a phone removed or a key set again reaches the checks with the next run, within the
+hour. A 2xx answer means up. Any other status, a redirect, no answer in
 10 s or no connection means down.
 
 - **Down** is sent only after two checks a minute apart fail. It goes through APNs as an alarm that
@@ -98,11 +100,14 @@ GITHUB_REPOSITORY=you/cluenori-watch GITHUB_TOKEN=$(gh auth token) CLUENORI_URL=
 
 ## Limits
 
-- A watching run is a GitHub-hosted job that is busy for 5 h 40 min at a time, mostly asleep
-  between checks. GitHub's terms for Actions ask for no burden disproportionate to its benefit and
-  for use related to the repository's software; a monitor running all day is a gray zone, and
-  GitHub may stop such jobs or disable the repository. To stop watching, disable the Watch
-  workflow; a run cancelled by hand starts no next one.
+- **GitHub's terms.** They say "You may only access and use GitHub Actions to develop and test
+  your application(s)", and forbid a burden disproportionate to the benefit, naming use "as part of
+  a serverless application" as an example. Watching a production deployment from GitHub-hosted
+  runners is outside the letter of that, whether runs are started by the schedule, by an outside
+  cron service, or by each other; a runner busy all day adds the burden. GitHub may stop such jobs,
+  restrict Actions, disable the repository, or in some cases act on the account. Running the watch
+  off GitHub-hosted runners avoids this. To stop watching, disable the Watch workflow; a run
+  cancelled by hand starts no next one.
 - Nothing notices a broken chain on its own: if a run dies without starting the next (a runner
   lost, GitHub down), only GitHub's schedule starts one again. A run that can't start the next one
   fails red and says so.

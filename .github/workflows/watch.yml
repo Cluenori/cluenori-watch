@@ -2,10 +2,12 @@
 # its schedule, by hand, and as the next run of itself: never for a pull request, so no fork's code
 # ever sees these secrets.
 #
-# A watching run checks every 5 minutes for 5 h 40 min, then starts the next watching run, so the
+# A watching run checks every 5 minutes for 55 minutes, then starts the next watching run, so the
 # watch goes on whether or not GitHub's schedule starts runs (it may start them late, skip them, or,
 # for a new repository, not start them at all). The schedule stays, to start the chain again if it
-# ever breaks. To stop watching, disable this workflow; a run cancelled by hand starts no next one.
+# ever breaks. Runs are short because a run reads its secrets when it is queued: a phone removed, or
+# a key set again, reaches the checks with the next run, within the hour. To stop watching, disable
+# this workflow; a run cancelled by hand starts no next one.
 name: Watch
 
 on:
@@ -28,9 +30,9 @@ on:
         type: boolean
         default: false
       minutes:
-        description: "watch: how long this run checks before it starts the next, at most 340. Shorter only to try a handover."
+        description: "watch: how long this run checks before it starts the next, at most 55. Shorter only to try a handover."
         type: number
-        default: 340
+        default: 55
 
 # Nothing, unless a job asks for it.
 permissions: {}
@@ -39,8 +41,8 @@ jobs:
   watch:
     if: github.event.schedule != '17 4 * * 1'
     runs-on: ubuntu-24.04
-    # A watching run checks for 5 h 40 min at most; GitHub stops any job at 6 h.
-    timeout-minutes: 355
+    # A watching run checks for 55 minutes, and its last check takes a few more.
+    timeout-minutes: 65
     # Every run that writes the outage's state is in `watch`, one at a time, so two never act on the
     # same outage: a run that comes while one watches waits, replacing any run already waiting, and
     # never cancels the one watching. A test or a dry run writes no state, and runs on its own.
@@ -64,7 +66,7 @@ jobs:
       - run: if [ "$LOOP" = true ]; then ./watch-loop.sh; else node src/main.ts; fi
         env:
           LOOP: ${{ ((inputs.mode || 'watch') == 'watch' && !inputs.dry_run) && 'true' || 'false' }}
-          LOOP_MINUTES: ${{ inputs.minutes || 340 }}
+          LOOP_MINUTES: ${{ inputs.minutes || 55 }}
           MODE: ${{ inputs.mode || 'watch' }}
           DRY_RUN: ${{ inputs.dry_run || false }}
           GITHUB_TOKEN: ${{ github.token }}
@@ -80,10 +82,12 @@ jobs:
 
   # Starts the next watching run once this one is done, whether its checks all passed or not; it then
   # waits for nothing, as `watch` has ended. Its own job, so the token that may start runs never
-  # reaches the checks, and the checks' secrets never reach it. Not after a run cancelled by hand.
+  # reaches the checks, and the checks' secrets never reach it. Only after `watch` ran: not after a
+  # run cancelled by hand, nor after one whose `watch` was cancelled while it waited, replaced by a
+  # newer run (`!cancelled()` alone doesn't say that), which would start runs that start runs.
   next:
     needs: watch
-    if: ${{ !cancelled() && github.event.schedule != '17 4 * * 1' && (inputs.mode || 'watch') == 'watch' && !inputs.dry_run }}
+    if: ${{ !cancelled() && (needs.watch.result == 'success' || needs.watch.result == 'failure') && github.event.schedule != '17 4 * * 1' && (inputs.mode || 'watch') == 'watch' && !inputs.dry_run }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
