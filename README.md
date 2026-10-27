@@ -7,8 +7,12 @@ Cluenori, and also writes to Telegram and sends email.
 
 ## What it does
 
-Every 5 minutes (GitHub's shortest schedule, which GitHub may start late or skip under load), it
-asks `<deployment>/api/health`. A 2xx answer means up. Any other status, a redirect, no answer in
+Every 5 minutes it asks `<deployment>/api/health`. A watching run checks on every 5-minute mark for
+5 h 40 min, then starts the next watching run, so the watch doesn't depend on GitHub's schedule,
+which may start runs late, skip them, or, for a new repository, not start them at all. The schedule
+stays as a backstop that starts a watching run again if the chain ever breaks. Runs that write the
+outage's state go one at a time, and each check reads that state from the issue afresh, so a
+handover between runs loses nothing and sends nothing twice. A 2xx answer means up. Any other status, a redirect, no answer in
 10 s or no connection means down.
 
 - **Down** is sent only after two checks a minute apart fail. It goes through APNs as an alarm that
@@ -94,8 +98,14 @@ GITHUB_REPOSITORY=you/cluenori-watch GITHUB_TOKEN=$(gh auth token) CLUENORI_URL=
 
 ## Limits
 
-- GitHub may start a scheduled run late, or skip it, under load, so Down can come several minutes
-  after the outage began.
+- A watching run is a GitHub-hosted job that is busy for 5 h 40 min at a time, mostly asleep
+  between checks. GitHub's terms for Actions ask for no burden disproportionate to its benefit and
+  for use related to the repository's software; a monitor running all day is a gray zone, and
+  GitHub may stop such jobs or disable the repository. To stop watching, disable the Watch
+  workflow; a run cancelled by hand starts no next one.
+- Nothing notices a broken chain on its own: if a run dies without starting the next (a runner
+  lost, GitHub down), only GitHub's schedule starts one again. A run that can't start the next one
+  fails red and says so.
 - GitHub turns off schedules in a public repository after 60 days without activity. A weekly job
   turns the workflow back on so that never happens.
 - Telegram's bot only sends. It never reads updates or sets a webhook, so the same bot can later

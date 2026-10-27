@@ -1,5 +1,11 @@
 # Checks the Cluenori deployment every 5 minutes and alerts its owners when it's down. Runs only on
-# its schedule and by hand: never for a pull request, so no fork's code ever sees these secrets.
+# its schedule, by hand, and as the next run of itself: never for a pull request, so no fork's code
+# ever sees these secrets.
+#
+# A watching run checks every 5 minutes for 5 h 40 min, then starts the next watching run, so the
+# watch goes on whether or not GitHub's schedule starts runs (it may start them late, skip them, or,
+# for a new repository, not start them at all). The schedule stays, to start the chain again if it
+# ever breaks. To stop watching, disable this workflow; a run cancelled by hand starts no next one.
 name: Watch
 
 on:
@@ -21,6 +27,10 @@ on:
         description: "Show exactly what each channel would send, and send and write nothing."
         type: boolean
         default: false
+      minutes:
+        description: "watch: how long this run checks before it starts the next, at most 340. Shorter only to try a handover."
+        type: number
+        default: 340
 
 # Nothing, unless a job asks for it.
 permissions: {}
@@ -29,11 +39,13 @@ jobs:
   watch:
     if: github.event.schedule != '17 4 * * 1'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    # One run at a time, so two never open the same outage; a run waiting behind one is replaced by
-    # the next.
+    # A watching run checks for 5 h 40 min at most; GitHub stops any job at 6 h.
+    timeout-minutes: 355
+    # Every run that writes the outage's state is in `watch`, one at a time, so two never act on the
+    # same outage: a run that comes while one watches waits, replacing any run already waiting, and
+    # never cancels the one watching. A test or a dry run writes no state, and runs on its own.
     concurrency:
-      group: watch
+      group: ${{ ((inputs.mode || 'watch') == 'watch' && !inputs.dry_run) && 'watch' || format('watch-once-{0}', github.run_id) }}
       cancel-in-progress: false
     permissions:
       # Reading this repository's code, and the outage's issue: opening, updating and closing it.
@@ -48,8 +60,11 @@ jobs:
           node-version: "26"
       # The two runtime dependencies at the lockfile's versions, without their install scripts.
       - run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
-      - run: node src/main.ts
+      # Watching: a check every 5 minutes (watch-loop.sh). A test or a dry run: once.
+      - run: if [ "$LOOP" = true ]; then ./watch-loop.sh; else node src/main.ts; fi
         env:
+          LOOP: ${{ ((inputs.mode || 'watch') == 'watch' && !inputs.dry_run) && 'true' || 'false' }}
+          LOOP_MINUTES: ${{ inputs.minutes || 340 }}
           MODE: ${{ inputs.mode || 'watch' }}
           DRY_RUN: ${{ inputs.dry_run || false }}
           GITHUB_TOKEN: ${{ github.token }}
@@ -62,6 +77,30 @@ jobs:
           CLOUDFLARE_EMAIL_TOKEN: ${{ secrets.CLOUDFLARE_EMAIL_TOKEN }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
+
+  # Starts the next watching run once this one is done, whether its checks all passed or not; it then
+  # waits for nothing, as `watch` has ended. Its own job, so the token that may start runs never
+  # reaches the checks, and the checks' secrets never reach it. Not after a run cancelled by hand.
+  next:
+    needs: watch
+    if: ${{ !cancelled() && github.event.schedule != '17 4 * * 1' && (inputs.mode || 'watch') == 'watch' && !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      # Starting this workflow; nothing else.
+      actions: write
+    steps:
+      - run: |
+          for _ in 1 2 3 4 5; do
+            if gh workflow run watch.yml --repo "$GITHUB_REPOSITORY" --ref main -f mode=watch; then
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::The next watching run couldn't be started: nothing watches Cluenori until one starts (by hand, or on GitHub's schedule)."
+          exit 1
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   keepalive:
     if: github.event.schedule == '17 4 * * 1'
