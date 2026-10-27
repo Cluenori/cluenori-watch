@@ -1,0 +1,76 @@
+# Checks the Cluenori deployment every 5 minutes and alerts its owners when it's down. Runs only on
+# its schedule and by hand: never for a pull request, so no fork's code ever sees these secrets.
+name: Watch
+
+on:
+  schedule:
+    # Every 5 minutes, GitHub's shortest, off the hour's busy start. GitHub may start a run late or
+    # skip one under load.
+    - cron: "2-59/5 * * * *"
+    # Once a week: enables this workflow again, so GitHub's rule that stops schedules in a public
+    # repository after 60 days without activity never stops it.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "watch: check now, and alert on a change. test: send a test through every channel."
+        type: choice
+        options: [watch, test]
+        default: watch
+      dry_run:
+        description: "Show exactly what each channel would send, and send and write nothing."
+        type: boolean
+        default: false
+
+# Nothing, unless a job asks for it.
+permissions: {}
+
+jobs:
+  watch:
+    if: github.event.schedule != '17 4 * * 1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # One run at a time, so two never open the same outage; a run waiting behind one is replaced by
+    # the next.
+    concurrency:
+      group: watch
+      cancel-in-progress: false
+    permissions:
+      # Reading this repository's code, and the outage's issue: opening, updating and closing it.
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26"
+      # The two runtime dependencies at the lockfile's versions, without their install scripts.
+      - run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+      - run: node src/main.ts
+        env:
+          MODE: ${{ inputs.mode || 'watch' }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
+          GITHUB_TOKEN: ${{ github.token }}
+          CLUENORI_URL: ${{ secrets.CLUENORI_URL }}
+          CLUENORI_APNS_KEY: ${{ secrets.CLUENORI_APNS_KEY }}
+          CLUENORI_PHONES: ${{ secrets.CLUENORI_PHONES }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_EMAIL_TOKEN: ${{ secrets.CLOUDFLARE_EMAIL_TOKEN }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+
+  keepalive:
+    if: github.event.schedule == '17 4 * * 1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      # Enabling this workflow; nothing else.
+      actions: write
+    steps:
+      - run: gh workflow enable watch.yml --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
