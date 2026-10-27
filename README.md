@@ -5,6 +5,15 @@ tell anyone it's down while it's down. This repository's GitHub Actions schedule
 the owners' iPhones through APNs, which is Apple's service and needs neither Cloudflare nor
 Cluenori, and also writes to Telegram and sends email.
 
+**Status: disabled.** The Watch workflow is turned off, so nothing watches the deployment. GitHub
+never started its schedule, and running a production monitor on GitHub-hosted runners is outside
+GitHub's Actions terms, which allow Actions only "to develop and test your application(s)"; the risk
+would fall on the Cluenori organization. Where the watcher runs instead is still to be decided. To
+resume: choose a host off GitHub Actions and adapt the watcher to it (its secrets, the issue token,
+and the APNs key and phones that Cluenori now writes as Actions secrets), or accept the terms risk
+and run the chain of runs kept on the `chain` branch. Its secrets, the GitHub App's install and
+Cluenori's watcher setting are left in place.
+
 ## What it does
 
 Every 5 minutes (GitHub's shortest schedule, which GitHub may start late or skip under load), it
