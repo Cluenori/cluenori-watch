@@ -134,14 +134,14 @@ export const apns = Effect.gen(function* () {
     expiresAt: DateTime.addDuration(alert.at, keptByApns),
   })
   // Each phone is a channel of its own, so one that didn't take an alert is sent it again alone. It
-  // is named by its token's SHA-256, whose first 8 hex digits say nothing of the token, as the
-  // public issue records channels by name.
+  // is named by its token's SHA-256, which says nothing of the token, as the public issue records
+  // channels by name; the whole of it, so two phones never share a name.
   return yield* Effect.forEach(phones.value.phones, (phone) =>
     Effect.gen(function* () {
       const digest = yield* Effect.promise(() =>
         globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(phone.token)),
       )
-      const id = [...new Uint8Array(digest).slice(0, 4)].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+      const id = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("")
       const configured: Configured = {
         _tag: "On",
         secrets,

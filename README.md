@@ -23,16 +23,17 @@ asks `<deployment>/api/health`. A 2xx answer means up. Any other status, a redir
 - **A send the service refused is sent again,** through that channel only (each phone is its own
   channel), on the next runs, for an hour, timed as sent then so a late Down still rings.
 
-The issue is the only state, and it records each alert's delivery by channel (a phone by the first
-8 hex digits of its token's SHA-256, never the token). Every alert is sent at most once per attempt,
+The issue is the only state, and it records each alert's delivery by channel (a phone by its
+token's SHA-256, never the token). Every alert is sent at most once per attempt,
 and an alert that may have arrived is never sent again:
 
 - Before a run sends, it records the channels it is about to send through; after, which of them
   refused. If it can't record first, nothing is sent, so a broken run never sends Down every 5
   minutes.
 - **Refused** (the service answered no: a 5xx, a bad token): sent again on the next runs.
-- **Unknown** (no answer: a timeout, a dropped connection): it may have arrived, so it isn't sent
-  again. The run fails, and the issue says so.
+- **Unknown** (no answer: a timeout, a dropped connection; an answer that doesn't say it worked; a
+  channel that broke): it may have arrived, so it isn't sent again. The run fails, and the issue
+  says so.
 - **Final** (a phone without the app, an address that bounced): not sent again.
 
 **What this gives up:** an alert can be lost, never doubled. If a run stops after recording the

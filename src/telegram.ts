@@ -64,7 +64,8 @@ export const telegram = Effect.gen(function* () {
           }
           const description = Option.flatMap(answer, (each) => Option.fromUndefinedOr(each.description))
           return yield* new ChannelFailed({
-            delivery: "refused",
+            // Telegram's own error status says it didn't send. A 200 it can't be sure of may have.
+            delivery: response.status === 200 ? "unknown" : "refused",
             reason: `HTTP ${response.status}${Option.match(description, { onNone: () => "", onSome: (text) => `: ${text}` })}`,
           })
         }).pipe(

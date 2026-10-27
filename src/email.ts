@@ -96,7 +96,8 @@ export const email = Effect.gen(function* () {
           )
           const why = bounced.length > 0 ? "the address bounced" : messages.join(", ")
           return yield* new ChannelFailed({
-            delivery: bounced.length > 0 ? "final" : "refused",
+            // A 200 that doesn't say it worked may have: only an error status says it didn't.
+            delivery: bounced.length > 0 ? "final" : response.status === 200 ? "unknown" : "refused",
             reason: `HTTP ${response.status}${why === "" ? "" : `: ${why}`}`,
           })
         }).pipe(

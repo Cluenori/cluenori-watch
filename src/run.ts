@@ -87,8 +87,8 @@ const sendAll = Effect.fn("sendAll")(function* (
               })
             }
             const failure = Cause.findErrorOption(sent.cause)
-            // A channel that broke sent nothing it knows of: it is sent again, as a refusal is.
-            const delivery = Option.isSome(failure) ? failure.value.delivery : "refused"
+            // A channel that broke may have broken after sending: what it did is unknown.
+            const delivery = Option.isSome(failure) ? failure.value.delivery : "unknown"
             const why = Option.isSome(failure) ? words(failure.value.reason) : "it stopped unexpectedly"
             if (delivery === "final") {
               yield* report.warning(`${channel.name} won't take "${alert.title}": ${why}`)

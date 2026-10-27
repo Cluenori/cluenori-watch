@@ -15,6 +15,10 @@ export const outageLabel = "cluenori-down"
  */
 export const outageAuthor = "github-actions[bot]"
 
+// The open outages are read this many to a page, for at most this many pages.
+const perPage = 100
+const maxPages = 3
+
 // GitHub answers within this, or the request failed.
 const answerTimeout = Duration.seconds(15)
 
@@ -55,8 +59,10 @@ const bodyOf = Effect.fn("bodyOf")(function* (state: OutageState) {
  */
 export interface Issues {
   /**
-   * The open outages, oldest first, at most 10: open issues with the outage's label that the
-   * workflow opened. At most one is down; others recovered and are still sending Recovered.
+   * The open outages, oldest first: open issues with the outage's label that the workflow opened.
+   * At most one is down; others recovered and are still sending Recovered. Fails, rather than
+   * leave one out, when there are 300 or more: it reads 3 pages of 100, and a third full page
+   * may not be the last.
    */
   readonly open: Effect.Effect<ReadonlyArray<Outage>, IssuesFailed>
   /** Opens an issue for a new outage, labelled, and returns it. */
@@ -139,12 +145,25 @@ export const makeIssues = Effect.fn("makeIssues")(function* (input: {
   })
 
   const open = Effect.gen(function* () {
-    // Asked of GitHub by author too, so others' issues never crowd the workflow's out of the page.
-    const answer = yield* ask(
-      "GET",
-      `/issues?state=open&labels=${outageLabel}&creator=${encodeURIComponent(outageAuthor)}&sort=created&direction=asc&per_page=10`,
-    )
-    const issues = yield* expect(answer, 200, "the open outages", Schema.Array(Issue))
+    // Asked of GitHub by author too, so others' issues never crowd the workflow's out, and page by
+    // page: an outage left out would be taken for none, and opened, and alerted, again.
+    const issues: Array<Issue> = []
+    for (let page = 1; ; page++) {
+      if (page > maxPages) {
+        return yield* new IssuesFailed({
+          reason: `${maxPages * perPage} or more open ${outageLabel} issues: close the old ones`,
+        })
+      }
+      const answer = yield* ask(
+        "GET",
+        `/issues?state=open&labels=${outageLabel}&creator=${encodeURIComponent(outageAuthor)}&sort=created&direction=asc&per_page=${perPage}&page=${page}`,
+      )
+      const listed = yield* expect(answer, 200, "the open outages", Schema.Array(Issue))
+      issues.push(...listed)
+      if (listed.length < perPage) {
+        break
+      }
+    }
     const ours = issues.filter((issue) => issue.pull_request === undefined && issue.user?.login === outageAuthor)
     return yield* Effect.forEach(ours, outageOf)
   })
