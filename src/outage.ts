@@ -8,7 +8,7 @@ export type Health =
 
 /**
  * The last alert's delivery, by channel name. A run records the channels it is about to send
- * through as `claimed` before it sends, then moves those that failed to `retry`. The next runs send
+ * through as `claimed` before it sends, then moves those the service refused to `retry` (not those whose outcome is unknown). The next runs send
  * `retry` again, claiming them first, for an hour. A channel still `claimed` when a run starts was
  * sent by a run that stopped before recording how it went: it may have arrived, so it is never sent
  * again. Each channel gets each alert at most once per attempt, and is never sent one twice after a

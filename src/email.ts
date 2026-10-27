@@ -81,7 +81,10 @@ export const email = Effect.gen(function* () {
           const response = yield* client.execute(request)
           const answer = yield* decodeAnswer(yield* response.text).pipe(Effect.option)
           if (Option.isNone(answer)) {
-            return yield* new ChannelFailed({ reason: `HTTP ${response.status}, an answer that isn't Cloudflare's` })
+            return yield* new ChannelFailed({
+              delivery: "unknown",
+              reason: `HTTP ${response.status}, an answer that isn't Cloudflare's`,
+            })
           }
           const result = answer.value.result ?? null
           const bounced = result?.permanent_bounces ?? []
@@ -93,13 +96,17 @@ export const email = Effect.gen(function* () {
           )
           const why = bounced.length > 0 ? "the address bounced" : messages.join(", ")
           return yield* new ChannelFailed({
+            delivery: bounced.length > 0 ? "final" : "refused",
             reason: `HTTP ${response.status}${why === "" ? "" : `: ${why}`}`,
           })
         }).pipe(
           Effect.timeout(answerTimeout),
           Effect.catchTags({
-            TimeoutError: () => Effect.fail(new ChannelFailed({ reason: "Cloudflare didn't answer in 15 s" })),
-            HttpClientError: () => Effect.fail(new ChannelFailed({ reason: "couldn't reach Cloudflare" })),
+            // Cloudflare may have taken it: sending it again could send it twice.
+            TimeoutError: () =>
+              Effect.fail(new ChannelFailed({ delivery: "unknown", reason: "Cloudflare didn't answer in 15 s" })),
+            HttpClientError: () =>
+              Effect.fail(new ChannelFailed({ delivery: "unknown", reason: "no answer from Cloudflare" })),
           }),
         ),
     },

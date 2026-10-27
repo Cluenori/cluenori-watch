@@ -1,4 +1,4 @@
-import { DateTime, Duration, Effect, Option, Redacted, Schema } from "effect"
+import { DateTime, Duration, Effect, Redacted, Schema } from "effect"
 import { HttpClient, HttpClientRequest } from "effect/http"
 
 import { timeText } from "./alert.ts"
@@ -54,8 +54,11 @@ const bodyOf = Effect.fn("bodyOf")(function* (state: OutageState) {
  * passes through `redact` first: the repository is public.
  */
 export interface Issues {
-  /** The open outage, if any: the oldest open issue with the outage's label that the workflow opened. */
-  readonly open: Effect.Effect<Option.Option<Outage>, IssuesFailed>
+  /**
+   * The open outages, oldest first, at most 10: open issues with the outage's label that the
+   * workflow opened. At most one is down; others recovered and are still sending Recovered.
+   */
+  readonly open: Effect.Effect<ReadonlyArray<Outage>, IssuesFailed>
   /** Opens an issue for a new outage, labelled, and returns it. */
   readonly openOutage: (state: OutageState) => Effect.Effect<Outage, IssuesFailed>
   /** Replaces the issue's state with `state`, and returns the outage as it now is. */
@@ -136,10 +139,14 @@ export const makeIssues = Effect.fn("makeIssues")(function* (input: {
   })
 
   const open = Effect.gen(function* () {
-    const answer = yield* ask("GET", `/issues?state=open&labels=${outageLabel}&sort=created&direction=asc&per_page=10`)
+    // Asked of GitHub by author too, so others' issues never crowd the workflow's out of the page.
+    const answer = yield* ask(
+      "GET",
+      `/issues?state=open&labels=${outageLabel}&creator=${encodeURIComponent(outageAuthor)}&sort=created&direction=asc&per_page=10`,
+    )
     const issues = yield* expect(answer, 200, "the open outages", Schema.Array(Issue))
-    const oldest = issues.find((issue) => issue.pull_request === undefined && issue.user?.login === outageAuthor)
-    return oldest === undefined ? Option.none<Outage>() : Option.some(yield* outageOf(oldest))
+    const ours = issues.filter((issue) => issue.pull_request === undefined && issue.user?.login === outageAuthor)
+    return yield* Effect.forEach(ours, outageOf)
   })
 
   const openOutage = Effect.fn("openOutage")(function* (state: OutageState) {

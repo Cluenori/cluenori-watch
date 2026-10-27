@@ -4,14 +4,18 @@ import { Config, Option, Schema } from "effect"
 import type { Alert } from "./alert.ts"
 
 /**
- * A channel couldn't deliver an alert, and why: the service's own words, which may echo what was
- * sent, so the run redacts and shortens them before showing them anywhere.
+ * A channel couldn't deliver an alert: why, in the service's own words, which may echo what was
+ * sent, so the run redacts and shortens them before showing them anywhere; and what is known of
+ * it. `refused`: it definitely didn't arrive, and may later, so it is sent again. `unknown`: it may
+ * have arrived (no answer, or none that could be read), so it is never sent again. `final`: it
+ * never will, as for a phone without the app, so it isn't sent again either.
  */
 export class ChannelFailed extends Schema.TaggedError<ChannelFailed>()("ChannelFailed", {
   reason: Schema.String,
+  delivery: Schema.Literals(["refused", "unknown", "final"]),
 }) {}
 
-/** One way an alert reaches the founder: APNs to Cluenori's iPhone app, Telegram, or email. */
+/** One way an alert reaches the founder: APNs to one phone with Cluenori's iPhone app, Telegram, or email. */
 export interface Channel {
   readonly name: string
   /**
@@ -19,7 +23,7 @@ export interface Channel {
    * secrets as they are (the report masks them).
    */
   readonly preview: (alert: Alert) => ReadonlyArray<string>
-  /** Sends `alert`, saying what took it: `2 phones`, `delivered`. Never fails another channel. */
+  /** Sends `alert`, saying what took it: `accepted`, `delivered`. Never fails another channel. */
   readonly send: (alert: Alert) => Effect.Effect<string, ChannelFailed>
 }
 

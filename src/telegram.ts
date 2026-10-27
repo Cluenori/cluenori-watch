@@ -64,13 +64,17 @@ export const telegram = Effect.gen(function* () {
           }
           const description = Option.flatMap(answer, (each) => Option.fromUndefinedOr(each.description))
           return yield* new ChannelFailed({
+            delivery: "refused",
             reason: `HTTP ${response.status}${Option.match(description, { onNone: () => "", onSome: (text) => `: ${text}` })}`,
           })
         }).pipe(
           Effect.timeout(answerTimeout),
           Effect.catchTags({
-            TimeoutError: () => Effect.fail(new ChannelFailed({ reason: "Telegram didn't answer in 10 s" })),
-            HttpClientError: () => Effect.fail(new ChannelFailed({ reason: "couldn't reach Telegram" })),
+            // Telegram may have taken it: sending it again could say it twice.
+            TimeoutError: () =>
+              Effect.fail(new ChannelFailed({ delivery: "unknown", reason: "Telegram didn't answer in 10 s" })),
+            HttpClientError: () =>
+              Effect.fail(new ChannelFailed({ delivery: "unknown", reason: "no answer from Telegram" })),
           }),
         ),
     },

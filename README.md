@@ -20,15 +20,32 @@ asks `<deployment>/api/health`. A 2xx answer means up. Any other status, a redir
 - A failure that the second check doesn't confirm changes nothing and sends nothing.
 - One channel failing, or breaking, never stops the others. A failed send fails the run, so it
   shows red with the reason, and the issue's comment lists what each channel did.
-- **A failed send is sent again,** through that channel only, on the next runs, for an hour.
+- **A send the service refused is sent again,** through that channel only (each phone is its own
+  channel), on the next runs, for an hour, timed as sent then so a late Down still rings.
 
-The issue is the only state, and it records each alert's delivery by channel. Before a run sends,
-it records the channels it is about to send through; after, which of them failed. If it can't
-record first, nothing is sent, so a broken run never sends Down every 5 minutes. If it stops after
-sending and before recording how it went, those channels aren't sent that alert again: it may have
-arrived, and an alert never comes twice. Only an issue that this workflow opened and labelled
-`cluenori-down` counts, so an issue a stranger opens never counts as an outage, even when someone
-labels it. What the run writes to the issue is redacted like its log: the repository is public.
+The issue is the only state, and it records each alert's delivery by channel (a phone by the first
+8 hex digits of its token's SHA-256, never the token). Every alert is sent at most once per attempt,
+and an alert that may have arrived is never sent again:
+
+- Before a run sends, it records the channels it is about to send through; after, which of them
+  refused. If it can't record first, nothing is sent, so a broken run never sends Down every 5
+  minutes.
+- **Refused** (the service answered no: a 5xx, a bad token): sent again on the next runs.
+- **Unknown** (no answer: a timeout, a dropped connection): it may have arrived, so it isn't sent
+  again. The run fails, and the issue says so.
+- **Final** (a phone without the app, an address that bounced): not sent again.
+
+**What this gives up:** an alert can be lost, never doubled. If a run stops after recording the
+channels and before recording how sending went (the runner dies, or GitHub's answer to that write
+is lost), those channels count as unknown and aren't sent that alert again, though it may never
+have gone. A Down lost this way is followed by the hourly reminder. A Recovered lost this way isn't
+sent at all, so an alarm still ringing is stopped by hand on the phone, and the issue says so.
+
+Only an issue that this workflow opened and labelled `cluenori-down` counts, so an issue a stranger
+opens never counts as an outage, even when someone labels it. A recovered outage's issue stays open
+until Recovered reached every channel, or for an hour, even if a new outage opens meanwhile, so the
+old alarm still gets its stop. What the run writes to the issue is redacted like its log: the
+repository is public.
 
 ## Set it up
 

@@ -54,18 +54,21 @@ export const apnsPayload = (alert: Alert) => ({
 
 /**
  * Cluenori's iPhone app, through APNs, from `CLUENORI_APNS_KEY` and `CLUENORI_PHONES`, which
- * Cluenori writes. Reaches the phones without Cloudflare or Cluenori: APNs is Apple's.
+ * Cluenori writes: one channel for each phone. Reaches the phones without Cloudflare or Cluenori:
+ * APNs is Apple's.
  */
 export const apns = Effect.gen(function* () {
   const keyText = yield* secret("CLUENORI_APNS_KEY")
   const phonesText = yield* secret("CLUENORI_PHONES")
   const name = "APNs"
   if (Option.isNone(keyText) && Option.isNone(phonesText)) {
-    return {
-      _tag: "Off",
-      name,
-      needs: "CLUENORI_APNS_KEY and CLUENORI_PHONES, which Cluenori writes once an owner names this repository",
-    } satisfies Configured
+    return [
+      {
+        _tag: "Off",
+        name,
+        needs: "CLUENORI_APNS_KEY and CLUENORI_PHONES, which Cluenori writes once an owner names this repository",
+      } satisfies Configured,
+    ]
   }
   // The phones' tokens and the key's lines are masked one by one: GitHub masks only each secret whole.
   const key = yield* Option.match(keyText, {
@@ -92,15 +95,17 @@ export const apns = Effect.gen(function* () {
           ? "CLUENORI_PHONES isn't the list Cluenori writes"
           : undefined
   if (problem !== undefined || Option.isNone(key) || Option.isNone(phones)) {
-    return { _tag: "Misconfigured", name, reason: problem ?? "unreadable", secrets } satisfies Configured
+    return [{ _tag: "Misconfigured", name, reason: problem ?? "unreadable", secrets } satisfies Configured]
   }
   if (phones.value.phones.length === 0) {
-    return {
-      _tag: "Misconfigured",
-      name,
-      reason: "no owner's phone has notifications on in Cluenori's iPhone app",
-      secrets,
-    } satisfies Configured
+    return [
+      {
+        _tag: "Misconfigured",
+        name,
+        reason: "no owner's phone has notifications on in Cluenori's iPhone app",
+        secrets,
+      } satisfies Configured,
+    ]
   }
   const { keyId, teamId, topic } = key.value
   // Built once for the run, in its scope: a key that can't sign is found now, before any alert.
@@ -108,12 +113,14 @@ export const apns = Effect.gen(function* () {
     Apns.layer({ key: Redacted.make(key.value.key), keyId, teamId }, globalThis.crypto.subtle),
   ).pipe(Effect.result)
   if (built._tag === "Failure") {
-    return {
-      _tag: "Misconfigured",
-      name,
-      reason: `the APNs key in CLUENORI_APNS_KEY can't sign: ${built.failure.reason}`,
-      secrets,
-    } satisfies Configured
+    return [
+      {
+        _tag: "Misconfigured",
+        name,
+        reason: `the APNs key in CLUENORI_APNS_KEY can't sign: ${built.failure.reason}`,
+        secrets,
+      } satisfies Configured,
+    ]
   }
   const sender = Context.get(built.success, Apns)
   const pushOf = (alert: Alert, phone: (typeof phones.value.phones)[number]): ApnsPush => ({
@@ -126,49 +133,61 @@ export const apns = Effect.gen(function* () {
     collapseId: alert.alert,
     expiresAt: DateTime.addDuration(alert.at, keptByApns),
   })
-  const count = (n: number) => (n === 1 ? "1 phone" : `${n} phones`)
-  const configured: Configured = {
-    _tag: "On",
-    secrets,
-    channel: {
-      name,
-      preview: (alert) =>
-        phones.value.phones.flatMap((phone, index) => {
-          const push = pushOf(alert, phone)
-          return [
-            `POST https://${phone.environment === "production" ? "api.push.apple.com" : "api.sandbox.push.apple.com"}/3/device/${phone.token} (phone ${index + 1})`,
-            `apns-topic: ${topic}, apns-push-type: alert, apns-priority: ${push.priority}, apns-collapse-id: ${alert.alert}, apns-expiration: ${DateTime.formatIso(DateTime.addDuration(alert.at, keptByApns))}`,
-            JSON.stringify(push.payload, null, 2),
-          ]
-        }),
-      send: (alert) =>
-        Effect.gen(function* () {
-          const problems: Array<string> = []
-          let accepted = 0
-          for (const [index, phone] of phones.value.phones.entries()) {
-            const answer = yield* sender.send(pushOf(alert, phone)).pipe(Effect.result)
-            const which = `phone ${index + 1} (${phone.environment})`
-            if (answer._tag === "Failure") {
-              const failure = answer.failure
-              if (failure._tag === "ApnsCredentialsRefused") {
-                return yield* new ChannelFailed({ reason: `APNs refused the key: ${failure.reason}` })
+  // Each phone is a channel of its own, so one that didn't take an alert is sent it again alone. It
+  // is named by its token's SHA-256, whose first 8 hex digits say nothing of the token, as the
+  // public issue records channels by name.
+  return yield* Effect.forEach(phones.value.phones, (phone) =>
+    Effect.gen(function* () {
+      const digest = yield* Effect.promise(() =>
+        globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(phone.token)),
+      )
+      const id = [...new Uint8Array(digest).slice(0, 4)].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+      const configured: Configured = {
+        _tag: "On",
+        secrets,
+        channel: {
+          name: `APNs phone ${id}`,
+          preview: (alert) => {
+            const push = pushOf(alert, phone)
+            return [
+              `POST https://${phone.environment === "production" ? "api.push.apple.com" : "api.sandbox.push.apple.com"}/3/device/${phone.token}`,
+              `apns-topic: ${topic}, apns-push-type: alert, apns-priority: ${push.priority}, apns-collapse-id: ${alert.alert}, apns-expiration: ${DateTime.formatIso(DateTime.addDuration(alert.at, keptByApns))}`,
+              JSON.stringify(push.payload, null, 2),
+            ]
+          },
+          send: (alert) =>
+            Effect.gen(function* () {
+              const answer = yield* sender.send(pushOf(alert, phone)).pipe(Effect.result)
+              if (answer._tag === "Failure") {
+                const failure = answer.failure
+                if (failure._tag === "ApnsCredentialsRefused") {
+                  return yield* new ChannelFailed({
+                    delivery: "refused",
+                    reason: `APNs refused the key: ${failure.reason}`,
+                  })
+                }
+                // APNs's own answer (too many requests, a server error) means it didn't take it; no
+                // answer means it may have.
+                return yield* new ChannelFailed({
+                  delivery: failure.reason.startsWith("APNs answered") ? "refused" : "unknown",
+                  reason: `APNs didn't take it: ${failure.reason}`,
+                })
               }
-              problems.push(`${which}: APNs didn't take it (${failure.reason})`)
-            } else if (answer.success._tag === "Accepted") {
-              accepted++
-            } else if (answer.success._tag === "Inactive") {
-              problems.push(`${which}: no longer registered; Cluenori forgets it on its next push`)
-            } else {
-              problems.push(`${which}: ${answer.success.reason}`)
-            }
-          }
-          const total = phones.value.phones.length
-          if (accepted === 0) {
-            return yield* new ChannelFailed({ reason: `no phone took it: ${problems.join("; ")}` })
-          }
-          return problems.length === 0 ? count(accepted) : `${accepted} of ${count(total)}; ${problems.join("; ")}`
-        }),
-    },
-  }
-  return configured
+              switch (answer.success._tag) {
+                case "Accepted":
+                  return `accepted (${phone.environment})`
+                case "Inactive":
+                  return yield* new ChannelFailed({
+                    delivery: "final",
+                    reason: "no longer registered; Cluenori forgets it on its next push",
+                  })
+                case "Rejected":
+                  return yield* new ChannelFailed({ delivery: "final", reason: answer.success.reason })
+              }
+            }),
+        },
+      }
+      return configured
+    }),
+  )
 }).pipe(Effect.catchTag("ConfigError", Effect.die))

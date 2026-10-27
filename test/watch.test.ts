@@ -1,7 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import { ConfigProvider, Crypto, Effect, Fiber, Layer, Schema } from "effect"
 import { Base64 } from "effect/encoding"
-import { HttpClient, HttpClientResponse } from "effect/http"
+import { HttpClient, HttpClientError, HttpClientResponse } from "effect/http"
 import { TestClock } from "effect/testing"
 
 import { program } from "../src/run.ts"
@@ -30,6 +30,8 @@ interface Issue {
 interface World {
   /** What each health check answers, in turn; the last one again once they run out. */
   health: Array<number>
+  /** How many health checks were answered. */
+  checks: number
   readonly issues: Array<Issue>
   /** What GitHub answers to opening an issue, when it doesn't open one. */
   openIssueStatus: number | undefined
@@ -37,6 +39,10 @@ interface World {
   /** What Cloudflare says when it refuses. */
   emailError: string
   telegramStatus: number
+  /** Telegram takes the message, and its answer is lost on the way back. */
+  telegramAnswerLost: boolean
+  /** The phones whose pushes APNs answers 503. */
+  readonly apnsFailing: Set<string>
   apnsStatus: number
   /** How many more issue updates GitHub refuses with 500. */
   failUpdates: number
@@ -67,11 +73,14 @@ const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))
 
 const newWorld = (): World => ({
   health: [204],
+  checks: 0,
   issues: [],
   openIssueStatus: undefined,
   emailStatus: 200,
   emailError: "email.sending.error.internal_server",
   telegramStatus: 200,
+  telegramAnswerLost: false,
+  apnsFailing: new Set(),
   apnsStatus: 200,
   failUpdates: 0,
   sent: { telegram: [], email: [], apns: [] },
@@ -103,6 +112,7 @@ const fakeClient = (world: World) =>
         })
       const path = url.pathname
       if (url.origin === deployment && path === "/api/health") {
+        world.checks++
         const status = world.health.length > 1 ? (world.health.shift() ?? 204) : (world.health[0] ?? 204)
         return yield* answer(status)
       }
@@ -110,10 +120,17 @@ const fakeClient = (world: World) =>
         const issues = "/repos/Cluenori/cluenori-watch/issues"
         if (request.method === "GET" && path === issues) {
           assert.strictEqual(url.searchParams.get("labels"), "cluenori-down")
+          const creator = url.searchParams.get("creator")
           return yield* answer(
             200,
             world.issues
-              .filter((issue) => issue.state === "open" && issue.labels.includes("cluenori-down"))
+              .filter(
+                (issue) =>
+                  issue.state === "open" &&
+                  issue.labels.includes("cluenori-down") &&
+                  (creator === null || issue.author === creator),
+              )
+              .slice(0, Number(url.searchParams.get("per_page") ?? 30))
               .map(issueJson),
           )
         }
@@ -164,6 +181,11 @@ const fakeClient = (world: World) =>
           text: String(body["text"]),
           disable_notification: body["disable_notification"] === true,
         })
+        if (world.telegramAnswerLost) {
+          return yield* new HttpClientError.HttpClientError({
+            reason: new HttpClientError.TransportError({ request, description: "connection reset" }),
+          })
+        }
         return yield* answer(200, { ok: true, result: {} })
       }
       if (url.origin === "https://api.cloudflare.com" && path === `/client/v4/accounts/${account}/email/sending/send`) {
@@ -181,8 +203,8 @@ const fakeClient = (world: World) =>
       const device = /^\/3\/device\/([0-9a-f]+)$/.exec(path)
       if (url.origin === "https://api.push.apple.com" && device !== null) {
         const token = device[1] ?? ""
-        if (world.apnsStatus !== 200) {
-          return yield* answer(world.apnsStatus, { reason: "ServiceUnavailable" })
+        if (world.apnsStatus !== 200 || world.apnsFailing.has(token)) {
+          return yield* answer(503, { reason: "ServiceUnavailable" })
         }
         if (token === oldPhoneToken) {
           return yield* answer(410, { reason: "Unregistered", timestamp: start })
@@ -262,6 +284,16 @@ const runOnce = (world: World, env: Record<string, string>) =>
       ),
       Effect.forkChild,
     )
+    // The clock moves once the run is asleep: after its first check, a few real ticks on, as the run
+    // waits on real I/O (Web Crypto) before it.
+    const before = world.checks
+    const tick = TestClock.withLive(Effect.sleep("1 millis"))
+    while (world.checks === before && fiber.pollUnsafe() === undefined) {
+      yield* tick
+    }
+    for (let each = 0; each < 5; each++) {
+      yield* tick
+    }
     yield* TestClock.adjust("1 minute")
     return yield* Fiber.join(fiber)
   })
@@ -408,7 +440,12 @@ describe("watching the deployment", () => {
       const down = yield* runOnce(world, yield* secretsWith([oldPhoneToken, phoneToken]))
       assert.isFalse(down.failed, down.summary)
       assert.strictEqual(world.sent.apns.length, 1)
-      assert.include(down.summary, "APNs: sent, 1 of 2 phones; phone 1 (production): no longer registered")
+      assert.match(down.summary, /APNs phone [0-9a-f]{8}: sent, accepted \(production\)/)
+      assert.match(down.summary, /APNs phone [0-9a-f]{8} won't take "Cluenori · Down": no longer registered/)
+      // A phone that's gone isn't sent it again.
+      yield* TestClock.adjust("4 minutes")
+      yield* runOnce(world, yield* secretsWith([oldPhoneToken, phoneToken]))
+      assert.strictEqual(world.sent.apns.length, 1)
     }),
   )
 
@@ -568,7 +605,7 @@ describe("watching the deployment", () => {
       assert.isTrue(down.failed)
       assert.strictEqual(world.sent.telegram.length, 1)
       assert.strictEqual(world.sent.email.length, 1)
-      assert.include(down.summary, "APNs couldn't send")
+      assert.match(down.summary, /APNs phone [0-9a-f]{8} couldn't send "Cluenori · Down": it stopped unexpectedly/)
     }),
   )
 
@@ -585,6 +622,129 @@ describe("watching the deployment", () => {
       for (const leaked of ["watch@notify", "founder@exam", "@example.com", "notify.example.net"]) {
         assert.notInclude(published, leaked)
       }
+    }),
+  )
+
+  it.effect("rings a Down sent again late as fresh, so the phone still rings it", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(start)
+      const world = newWorld()
+      const env = yield* secretsWith()
+      world.health = [503]
+      world.apnsStatus = 503
+      yield* runOnce(world, env)
+      assert.strictEqual(world.sent.apns.length, 0)
+      world.apnsStatus = 200
+      yield* TestClock.adjust("15 minutes")
+      yield* runOnce(world, env)
+      assert.strictEqual(world.sent.apns.length, 1)
+      const alarm = world.sent.apns[0]
+      assert.strictEqual(alarm?.payload.cluenori.level, "alarm")
+      // Sent at this run's time, 16 minutes after Down: the app rings an alarm under 10 minutes old.
+      assert.strictEqual(alarm?.payload.cluenori.at, "2026-10-27T10:18:00.000Z")
+    }),
+  )
+
+  it.effect("never sends again what a service may have taken without answering", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(start)
+      const world = newWorld()
+      const env = yield* secretsWith()
+      world.health = [503]
+      world.telegramAnswerLost = true
+      const down = yield* runOnce(world, env)
+      assert.isTrue(down.failed)
+      assert.include(down.summary, "may have arrived")
+      world.telegramAnswerLost = false
+      for (let run = 0; run < 3; run++) {
+        yield* TestClock.adjust("4 minutes")
+        yield* runOnce(world, env)
+      }
+      assert.strictEqual(world.sent.telegram.length, 1)
+    }),
+  )
+
+  it.effect("sends Recovered again to only the phone that didn't take it", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(start)
+      const world = newWorld()
+      const second = "ef".repeat(32)
+      const env = yield* secretsWith([phoneToken, second])
+      world.health = [503]
+      yield* runOnce(world, env)
+      assert.strictEqual(world.sent.apns.length, 2)
+      world.health = [204]
+      world.apnsFailing.add(second)
+      yield* TestClock.adjust("4 minutes")
+      yield* runOnce(world, env)
+      assert.strictEqual(world.issues[0]?.state, "open")
+      world.apnsFailing.clear()
+      yield* TestClock.adjust("4 minutes")
+      yield* runOnce(world, env)
+      assert.strictEqual(world.issues[0]?.state, "closed")
+      const recovered = world.sent.apns.filter((each) => each.payload.aps.alert.title === "Cluenori · Recovered")
+      assert.deepStrictEqual(recovered.map((each) => each.token).toSorted(), [phoneToken, second].toSorted())
+      assert.strictEqual(world.sent.telegram.length, 2)
+    }),
+  )
+
+  it.effect("still stops the old alarm when it goes down again before Recovered reached the phone", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(start)
+      const world = newWorld()
+      const env = yield* secretsWith()
+      world.health = [503]
+      yield* runOnce(world, env)
+      const first = world.sent.apns[0]?.payload.cluenori.alert
+      // Recovered, which no channel takes; then down again.
+      world.health = [204]
+      world.apnsStatus = 503
+      world.emailStatus = 500
+      world.telegramStatus = 502
+      yield* TestClock.adjust("4 minutes")
+      yield* runOnce(world, env)
+      world.health = [503]
+      yield* TestClock.adjust("4 minutes")
+      yield* runOnce(world, env)
+      assert.strictEqual(world.issues.length, 2)
+      // The channels come back: the old outage's Recovered stops its alarm, and its issue closes.
+      world.apnsStatus = 200
+      world.emailStatus = 200
+      world.telegramStatus = 200
+      yield* TestClock.adjust("4 minutes")
+      yield* runOnce(world, env)
+      const stop = world.sent.apns.find(
+        (each) => each.payload.cluenori.alert === first && each.payload.cluenori.level === "quiet",
+      )
+      assert.isDefined(stop)
+      assert.strictEqual(world.issues[0]?.state, "closed")
+      assert.strictEqual(world.issues[1]?.state, "open")
+      const second = world.sent.apns.find((each) => each.payload.cluenori.alert !== first)
+      assert.strictEqual(second?.payload.cluenori.level, "alarm")
+    }),
+  )
+
+  it.effect("finds its own outage behind ten labelled issues of others", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(start)
+      const world = newWorld()
+      for (let number = 1; number <= 10; number++) {
+        world.issues.push({
+          number,
+          author: "stranger",
+          state: "open",
+          body: "",
+          labels: ["cluenori-down"],
+          comments: [],
+        })
+      }
+      const env = yield* secretsWith()
+      world.health = [503]
+      yield* runOnce(world, env)
+      yield* TestClock.adjust("4 minutes")
+      yield* runOnce(world, env)
+      assert.strictEqual(world.issues.length, 11)
+      assert.strictEqual(world.sent.apns.length, 1)
     }),
   )
 })
